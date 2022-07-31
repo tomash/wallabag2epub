@@ -1,0 +1,5 @@
+url: https://blabla.com/
+user: jeanpierre
+password: somewhitenoise
+client_id: some ID generated in wallabag in API client management/create a new client/give any name
+client_secret: generated at the same place
