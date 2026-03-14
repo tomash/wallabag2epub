@@ -3,3 +3,6 @@ user: jeanpierre
 password: somewhitenoise
 client_id: some ID generated in wallabag in API client management/create a new client/give any name
 client_secret: generated at the same place
+extension: epub   # epub, pdf, mobi, html, etc.
+# merge: true     # optional: merge all exported EPUBs into one combined file with TOC
+# starred: true   # export only starred articles

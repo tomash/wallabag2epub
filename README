@@ -1,3 +1,0 @@
-Simple script to export many articles from wallabag as epub (or pdf)
-
-Few features and almost no error handling, written as an exercice to use wallabag from python.
