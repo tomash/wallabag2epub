@@ -1,3 +1,6 @@
 PyYAML
 requests
 ebooklib
+
+# dev / test
+pytest>=7.0
