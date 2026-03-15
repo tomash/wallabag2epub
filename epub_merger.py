@@ -1,9 +1,11 @@
 """EPUB merging: combine multiple EPUB files into one with a table of contents."""
 
 import os
+import re
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -16,6 +18,42 @@ except ImportError:
 # OPF namespace used in content.opf
 OPF_NS = "http://www.idpf.org/2007/opf"
 CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
+
+# Base filenames that are not the main article content (covers, TOC pages)
+_AUXILIARY_BASES = frozenset({"CoverPage.xhtml", "Cover2.html", "epub3toc.xhtml"})
+
+
+def _is_auxiliary_doc(file_name: str) -> bool:
+    """Return True if this document is a cover/TOC page, not main article content."""
+    base = file_name.split("/")[-1] if "/" in file_name else file_name
+    if base in _AUXILIARY_BASES:
+        return True
+    if base.endswith("_cover.html"):
+        return True
+    return False
+
+
+def _main_content_id(book: "epub.EpubBook") -> str | None:
+    """Return the item id of the first spine document that is main content (not auxiliary)."""
+    id_to_item = {item.get_id(): item for item in book.get_items() if item.get_id()}
+
+    def _item_for_entry(entry):
+        idref = entry[0] if isinstance(entry, (list, tuple)) else entry
+        if hasattr(idref, "get_id"):
+            idref = idref.get_id()
+        return id_to_item.get(idref) if isinstance(idref, str) else None
+
+    for entry in book.spine:
+        item = _item_for_entry(entry)
+        if not item or not isinstance(item, epub.EpubHtml):
+            continue
+        if not _is_auxiliary_doc(item.get_name() or ""):
+            return item.get_id()
+    for entry in book.spine:
+        item = _item_for_entry(entry)
+        if item and isinstance(item, epub.EpubHtml):
+            return item.get_id()
+    return None
 
 
 def _fix_epub_missing_manifest(epub_path: str) -> str:
@@ -162,6 +200,10 @@ class EpubMerger:
                 "ebooklib is required for merge. Install with: pip install ebooklib"
             )
 
+        # Default title with creation datetime (e.g. "Wallabag Export from 2026-03-15 17:30")
+        if not title or title == "Merged Articles":
+            title = f"Wallabag Export from {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
         merged = epub.EpubBook()
         merged.set_identifier("merged-" + str(hash(tuple(epub_paths)))[:12])
         merged.set_title(title)
@@ -169,6 +211,7 @@ class EpubMerger:
 
         toc_entries = []
         spine_items = ["nav"]
+        chapters_for_cover_remap = []  # EpubHtml items to fix CoverPage/toc links later
 
         for idx, path in enumerate(epub_paths):
             href_map = {}
@@ -178,6 +221,9 @@ class EpubMerger:
             except Exception as e:
                 print(f"Warning: Could not read {path}: {e}")
                 continue
+
+            main_content_id = _main_content_id(book)
+            added_toc_for_article = False
 
             doc_items = []
             resource_items = []
@@ -247,13 +293,49 @@ class EpubMerger:
                     content.encode("utf-8") if isinstance(content, str) else content
                 )
                 merged.add_item(new_chapter)
-                toc_entries.append(epub.Link(new_href, chapter_title, new_id))
+                # Only one TOC entry per article: the main content (not covers/toc pages)
+                if not added_toc_for_article and (
+                    main_content_id is None or item.get_id() == main_content_id
+                ):
+                    toc_entries.append(epub.Link(new_href, chapter_title, new_id))
+                    added_toc_for_article = True
                 spine_items.append(new_chapter)
+                chapters_for_cover_remap.append(new_chapter)
 
         merged.toc = tuple(toc_entries)
         merged.spine = spine_items
         merged.add_item(epub.EpubNcx())
         merged.add_item(epub.EpubNav())
+
+        # Point each article's CoverPage/toc links to the merged TOC (nav)
+        nav_item = next(
+            (i for i in merged.get_items() if isinstance(i, epub.EpubNav)), None
+        )
+        if nav_item:
+            nav_href = nav_item.get_name() or ""
+            if nav_href:
+                for chapter in chapters_for_cover_remap:
+                    raw = chapter.get_content()
+                    if raw is None:
+                        continue
+                    text = raw.decode("utf-8", errors="replace")
+                    # Remap article_*_CoverPage.xhtml and article_*_epub3toc.xhtml -> nav
+                    new_text = re.sub(
+                        r"article_\d+_CoverPage\.xhtml",
+                        nav_href,
+                        text,
+                    )
+                    new_text = re.sub(
+                        r"article_\d+_epub3toc\.xhtml",
+                        nav_href,
+                        new_text,
+                    )
+                    if new_text != text:
+                        chapter.set_content(
+                            new_text.encode("utf-8")
+                            if isinstance(new_text, str)
+                            else new_text
+                        )
 
         epub.write_epub(output_path, merged)
         return output_path
