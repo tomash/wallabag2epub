@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from wallabag2epub import Wallabag2Epub, EBOOKLIB_AVAILABLE
+from wallabag2epub import Wallabag2Epub
 
 
 @pytest.fixture
@@ -241,52 +241,6 @@ class TestSanitizeFilename:
     def test_sanitize_strips_trailing_whitespace(self, client):
         # rstrip() only removes trailing whitespace, not leading
         assert client._sanitize_filename("Title  ") == "Title"
-
-
-class TestMergeEpubs:
-    """Tests for merge_epubs static method."""
-
-    @pytest.mark.skipif(not EBOOKLIB_AVAILABLE, reason="ebooklib not installed")
-    def test_merge_epubs_creates_output_file(self, tmp_path):
-        # Create minimal valid EPUB files using ebooklib
-        from ebooklib import epub
-
-        epub1 = tmp_path / "a.epub"
-        epub2 = tmp_path / "b.epub"
-        out = tmp_path / "merged.epub"
-
-        book1 = epub.EpubBook()
-        book1.set_identifier("id1")
-        book1.set_title("Article 1")
-        book1.set_language("en")
-        c1 = epub.EpubHtml(title="Ch1", file_name="ch1.xhtml", lang="en")
-        c1.set_content(b"<html><body>Content 1</body></html>")
-        book1.add_item(c1)
-        book1.spine = ["nav", c1]
-        epub.write_epub(str(epub1), book1)
-
-        book2 = epub.EpubBook()
-        book2.set_identifier("id2")
-        book2.set_title("Article 2")
-        book2.set_language("en")
-        c2 = epub.EpubHtml(title="Ch2", file_name="ch2.xhtml", lang="en")
-        c2.set_content(b"<html><body>Content 2</body></html>")
-        book2.add_item(c2)
-        book2.spine = ["nav", c2]
-        epub.write_epub(str(epub2), book2)
-
-        result = Wallabag2Epub.merge_epubs(
-            [str(epub1), str(epub2)], str(out), title="Merged"
-        )
-
-        assert result == str(out)
-        assert out.exists()
-        assert out.stat().st_size > 0
-
-    def test_merge_epubs_raises_without_ebooklib(self):
-        with patch("wallabag2epub.EBOOKLIB_AVAILABLE", False):
-            with pytest.raises(ImportError, match="ebooklib is required"):
-                Wallabag2Epub.merge_epubs([], "/tmp/out.epub")
 
 
 class TestRun:

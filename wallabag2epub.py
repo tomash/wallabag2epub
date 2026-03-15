@@ -27,12 +27,7 @@ starred: true     # default, or false
 import yaml
 import requests
 
-try:
-    import ebooklib
-    from ebooklib import epub
-    EBOOKLIB_AVAILABLE = True
-except ImportError:
-    EBOOKLIB_AVAILABLE = False
+from epub_merger import EpubMerger
 
 
 class Wallabag2Epub:
@@ -210,133 +205,15 @@ class Wallabag2Epub:
         if (
             self.extension == "epub"
             and self.merge
-            and EBOOKLIB_AVAILABLE
+            and EpubMerger.is_available()
             and exported_files
         ):
-            merged_path = self.merge_epubs(
+            merged_path = EpubMerger().merge(
                 exported_files, "merged_articles.epub", title="Wallabag Export"
             )
             print("Merged all articles into", merged_path)
 
         return exported_files
-
-    @staticmethod
-    def merge_epubs(
-        epub_paths: list[str],
-        output_path: str,
-        title: str = "Merged Articles",
-    ) -> str:
-        """
-        Merge multiple EPUB files into a single combined EPUB with table of contents.
-
-        Args:
-            epub_paths: List of paths to EPUB files (order preserved)
-            output_path: Path for the merged output EPUB
-            title: Title for the merged book
-
-        Returns:
-            Path to the created file, or None if ebooklib is not available.
-        """
-        if not EBOOKLIB_AVAILABLE:
-            raise ImportError(
-                "ebooklib is required for merge_epubs. Install with: pip install ebooklib"
-            )
-
-        merged = epub.EpubBook()
-        merged.set_identifier("merged-" + str(hash(tuple(epub_paths)))[:12])
-        merged.set_title(title)
-        merged.set_language("en")
-
-        toc_entries = []
-        spine_items = ["nav"]
-
-        for idx, path in enumerate(epub_paths):
-            href_map = {}
-            prefix = f"article_{idx:04d}_"
-            try:
-                book = epub.read_epub(path, options={"ignore_ncx": True})
-            except Exception as e:
-                print(f"Warning: Could not read {path}: {e}")
-                continue
-
-            doc_items = []
-            resource_items = []
-
-            for item in book.get_items():
-                if isinstance(item, epub.EpubHtml):
-                    doc_items.append(item)
-                else:
-                    resource_items.append(item)
-
-            for item in resource_items:
-                if isinstance(item, (epub.EpubNcx, epub.EpubNav)):
-                    continue
-                if not isinstance(item, epub.EpubItem):
-                    continue
-                old_href = item.get_name()
-                base = old_href.split("/")[-1] if "/" in old_href else old_href
-                new_href = f"{prefix}res/{base}"
-                new_id = prefix + (item.get_id() or base).replace(".", "_").replace(
-                    "/", "_"
-                )
-
-                href_map[old_href] = new_href
-                href_map[f"./{old_href}"] = f"./{new_href}"
-
-                new_item = epub.EpubItem(
-                    uid=new_id,
-                    file_name=new_href,
-                    media_type=getattr(
-                        item, "media_type", "application/octet-stream"
-                    ),
-                    content=item.get_content(),
-                )
-                merged.add_item(new_item)
-
-            for item in doc_items:
-                old_href = item.get_name()
-                base = old_href.split("/")[-1] if "/" in old_href else old_href
-                if not base.endswith((".xhtml", ".html")):
-                    base = base + ".xhtml"
-                new_href = f"{prefix}{base}"
-                new_id = prefix + (item.get_id() or base).replace(".", "_").replace(
-                    "/", "_"
-                )
-
-                href_map[old_href] = new_href
-                href_map[f"./{old_href}"] = f"./{new_href}"
-
-                content = item.get_content()
-                if isinstance(content, bytes):
-                    content = content.decode("utf-8", errors="replace")
-
-                for old, new in sorted(href_map.items(), key=lambda x: -len(x[0])):
-                    content = content.replace(f'href="{old}"', f'href="{new}"')
-                    content = content.replace(f"href='{old}'", f"href='{new}'")
-                    content = content.replace(f'src="{old}"', f'src="{new}"')
-                    content = content.replace(f"src='{old}'", f"src='{new}'")
-
-                chapter_title = item.title or f"Article {idx + 1}"
-                new_chapter = epub.EpubHtml(
-                    title=chapter_title,
-                    file_name=new_href,
-                    lang="en",
-                    uid=new_id,
-                )
-                new_chapter.set_content(
-                    content.encode("utf-8") if isinstance(content, str) else content
-                )
-                merged.add_item(new_chapter)
-                toc_entries.append(epub.Link(new_href, chapter_title, new_id))
-                spine_items.append(new_chapter)
-
-        merged.toc = tuple(toc_entries)
-        merged.spine = spine_items
-        merged.add_item(epub.EpubNcx())
-        merged.add_item(epub.EpubNav())
-
-        epub.write_epub(output_path, merged)
-        return output_path
 
 
 def main() -> None:

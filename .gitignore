@@ -2,6 +2,7 @@
 
 wallabag2epub.login
 *.epub
+.vscode
 
 # Python specific files
 # Byte-compiled / optimized / DLL files
