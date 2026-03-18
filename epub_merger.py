@@ -1,12 +1,16 @@
 """EPUB merging: combine multiple EPUB files into one with a table of contents."""
 
+import argparse
 import os
 import re
+import sys
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
 try:
     from ebooklib import epub
@@ -31,6 +35,89 @@ def _is_auxiliary_doc(file_name: str) -> bool:
     if base.endswith("_cover.html"):
         return True
     return False
+
+
+_XML10_FORBIDDEN_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+_BARE_AMP_RE = re.compile(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z][A-Za-z0-9]+;)")
+
+
+def _sanitize_xhtml_text(text: str) -> str:
+    """
+    Best-effort sanitizer for XHTML/XML-ish content.
+
+    Common breakages seen in exported epubs:
+    - Control characters forbidden by XML 1.0
+    - Bare '&' in URLs or text
+    - HTML entities like &nbsp; used in XHTML without a DTD
+    """
+    text = _XML10_FORBIDDEN_RE.sub("", text)
+    # Keep a few common HTML entities usable in XML by converting them.
+    text = text.replace("&nbsp;", "&#160;")
+    # Escape bare ampersands (while keeping well-formed entities intact).
+    text = _BARE_AMP_RE.sub("&amp;", text)
+    return text
+
+
+def _download_url_bytes(url: str, timeout_s: int = 20) -> bytes:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "wallabag2epub/epub-merger (urllib)",
+            "Accept": "*/*",
+        },
+    )
+    with urlopen(req, timeout=timeout_s) as resp:  # nosec - user-controlled URLs
+        return resp.read()
+
+
+def _guess_image_url_from_href(href: str) -> str | None:
+    """
+    Attempt to recover an absolute URL from a broken/encoded href.
+
+    Examples observed:
+    - 'https:/example.com/a.jpg' (missing one slash)
+    - 'image?url=https:/example.com/a.jpg'
+    - 'OEBPS/images/https:/example.com/a.jpg' (href inside OPF)
+    """
+    if not href:
+        return None
+
+    # Direct absolute URL.
+    if href.startswith(("http://", "https://")):
+        return href
+
+    # Query param wrapper like image?url=...
+    if "url=" in href:
+        try:
+            parsed = urlparse(href)
+            qs = parse_qs(parsed.query)
+            raw = (qs.get("url") or [None])[0]
+            if raw:
+                raw = unquote(raw)
+                href = raw
+        except Exception:
+            pass
+
+    # Extract a url-looking substring.
+    m = re.search(r"https?:/[^/]", href)
+    if m:
+        href = href[m.start() :]
+
+    # Fix missing slash in scheme (https:/ -> https://)
+    href = re.sub(r"^(https?):/([^/])", r"\1://\2", href)
+    if href.startswith("//"):
+        href = "https:" + href
+
+    parsed = urlparse(href)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        return href
+    return None
+
+
+def _looks_like_image_url(url: str) -> bool:
+    p = urlparse(url)
+    path = (p.path or "").lower()
+    return any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"))
 
 
 def _main_content_id(book: "epub.EpubBook") -> str | None:
@@ -61,6 +148,8 @@ def _fix_epub_missing_manifest(epub_path: str) -> str:
     Create a temporary EPUB with manifest entries removed for files that are
     missing from the archive. ebooklib fails when the manifest references
     items (e.g. 'OEBPS/media') that do not exist in the zip.
+    If a missing manifest item looks like a downloadable remote image URL,
+    download it and embed it into the temporary EPUB instead of removing it.
     Returns path to the temporary fixed EPUB file.
     """
     path = Path(epub_path).resolve()
@@ -91,7 +180,8 @@ def _fix_epub_missing_manifest(epub_path: str) -> str:
         if manifest is None:
             return epub_path
 
-        ids_to_remove = []
+        ids_to_remove: list[str | None] = []
+        embedded_downloads: dict[str, bytes] = {}
         for item in manifest.findall("opf:item", ns):
             href = item.get("href")
             if not href:
@@ -100,9 +190,18 @@ def _fix_epub_missing_manifest(epub_path: str) -> str:
             full = f"{opf_dir}/{href}" if opf_dir else href
             full = full.lstrip("/").replace("//", "/")
             if full not in names:
+                # If this missing item is a remote image URL (or wrapper),
+                # try to download and embed it under the expected internal path.
+                url = _guess_image_url_from_href(href)
+                if url and _looks_like_image_url(url):
+                    try:
+                        embedded_downloads[full] = _download_url_bytes(url)
+                        continue
+                    except Exception:
+                        pass
                 ids_to_remove.append(item.get("id"))
 
-        if not ids_to_remove:
+        if not ids_to_remove and not embedded_downloads:
             return epub_path
 
         # Remove missing items from manifest
@@ -140,10 +239,42 @@ def _fix_epub_missing_manifest(epub_path: str) -> str:
                         out.writestr(name, new_opf.encode("utf-8"))
                     else:
                         out.writestr(name, zf.read(name))
+                for embedded_name, payload in embedded_downloads.items():
+                    out.writestr(embedded_name, payload)
             return tmp_path
         except Exception:
             Path(tmp_path).unlink(missing_ok=True)
             raise
+
+
+def _sanitize_epub_xhtml(epub_path: str) -> str:
+    """
+    Create a temporary EPUB where all .xhtml/.html files are sanitized to be
+    more XML-friendly (fixes 'not well-formed (invalid token)' failures).
+    """
+    path = Path(epub_path).resolve()
+    fd, tmp_path = tempfile.mkstemp(suffix=".epub")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(path, "r") as zf, zipfile.ZipFile(
+            tmp_path, "w", zipfile.ZIP_DEFLATED
+        ) as out:
+            for name in zf.namelist():
+                data = zf.read(name)
+                lower = name.lower()
+                if lower.endswith((".xhtml", ".html", ".htm")):
+                    try:
+                        text = data.decode("utf-8", errors="replace")
+                        text2 = _sanitize_xhtml_text(text)
+                        data = text2.encode("utf-8")
+                    except Exception:
+                        # Keep original bytes if sanitization fails.
+                        pass
+                out.writestr(name, data)
+        return tmp_path
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def _read_epub_robust(path: str, options: dict | None = None) -> "epub.EpubBook":
@@ -155,16 +286,27 @@ def _read_epub_robust(path: str, options: dict | None = None) -> "epub.EpubBook"
         options = {"ignore_ncx": True}
     try:
         return epub.read_epub(path, options=options)
-    except (KeyError, Exception) as e:
+    except Exception as e:
         err_msg = str(e)
-        if "There is no item named" not in err_msg and "no item named" not in err_msg.lower():
-            raise
-        fixed_path = _fix_epub_missing_manifest(path)
-        try:
-            return epub.read_epub(fixed_path, options=options)
-        finally:
-            if fixed_path != path and Path(fixed_path).exists():
-                Path(fixed_path).unlink(missing_ok=True)
+        # 1) Missing archive items referenced by OPF manifest.
+        if "There is no item named" in err_msg or "no item named" in err_msg.lower():
+            fixed_path = _fix_epub_missing_manifest(path)
+            try:
+                return epub.read_epub(fixed_path, options=options)
+            finally:
+                if fixed_path != path and Path(fixed_path).exists():
+                    Path(fixed_path).unlink(missing_ok=True)
+
+        # 2) Broken XHTML/XML content.
+        if "not well-formed" in err_msg.lower() or "invalid token" in err_msg.lower():
+            sanitized_path = _sanitize_epub_xhtml(path)
+            try:
+                return epub.read_epub(sanitized_path, options=options)
+            finally:
+                if sanitized_path != path and Path(sanitized_path).exists():
+                    Path(sanitized_path).unlink(missing_ok=True)
+
+        raise
 
 
 class EpubMerger:
@@ -357,3 +499,51 @@ class EpubMerger:
 
         epub.write_epub(output_path, merged)
         return output_path
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Merge multiple EPUB files into a single EPUB with a unified table of contents.",
+    )
+    parser.add_argument(
+        "epub_files",
+        nargs="+",
+        help="Paths to EPUB files to merge (order is preserved).",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="merged_articles.epub",
+        help="Base output filename (default: %(default)s). A timestamp suffix is always added.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if not EBOOKLIB_AVAILABLE:
+        parser.error(
+            "ebooklib is required to run the merger. Install it with: pip install ebooklib"
+        )
+
+    epub_paths = [str(Path(p)) for p in args.epub_files]
+    output_path = str(Path(args.output))
+
+    merger = EpubMerger()
+    try:
+        result = merger.merge(epub_paths, output_path=output_path)
+    except Exception as exc:  # pragma: no cover - CLI surface
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry
+    raise SystemExit(main())
