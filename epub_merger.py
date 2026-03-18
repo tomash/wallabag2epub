@@ -60,6 +60,11 @@ def _extract_missing_archive_name(err_msg: str) -> str | None:
       - "There is no item named 'OEBPS/images/https:/...jpg' in the archive"
       - "OEBPS/images/image?url=/images/...png"
     """
+    # ebooklib sometimes wraps the filename in a KeyError string using
+    # backslash-escaped quotes (e.g. "There is no item named \\'...\\' in the archive").
+    # Normalize those first so the regexes below can match reliably.
+    err_msg = (err_msg or "").replace("\\'", "'").replace('\\"', '"')
+
     # Most specific form first.
     m = re.search(r"There is no item named '([^']+)' in the archive", err_msg)
     if m:
@@ -321,7 +326,13 @@ def _fix_epub_missing_manifest(epub_path: str) -> str:
         opf_dir = str(Path(opf_name).parent) if "/" in opf_name else ""
 
         opf_bytes = zf.read(opf_name)
-        opf_root = ET.fromstring(opf_bytes)
+        try:
+            opf_root = ET.fromstring(opf_bytes)
+        except ET.ParseError:
+            # Some exported EPUBs have mildly broken OPF XML; if we can't parse
+            # it safely, fall back to the original EPUB and let other
+            # best-effort recovery paths handle missing items.
+            return epub_path
 
         # Register default namespace so find/findall work
         ET.register_namespace("", OPF_NS)
