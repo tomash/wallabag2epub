@@ -1,5 +1,6 @@
 """Unit tests for EpubMerger class."""
 
+import re
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -57,9 +58,13 @@ class TestEpubMergerMerge:
             [str(epub1), str(epub2)], str(out), title="Merged"
         )
 
-        assert result == str(out)
-        assert out.exists()
-        assert out.stat().st_size > 0
+        result_p = Path(result)
+        assert result_p.exists()
+        assert result_p.stat().st_size > 0
+        # Filename includes an ISO-ish timestamp made filesystem-safe (":" -> "-")
+        assert result_p.suffix == ".epub"
+        assert result_p.stem.startswith(out.stem + "_")
+        assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}", result_p.stem)
 
     def test_merge_raises_without_ebooklib(self):
         with patch("epub_merger.EBOOKLIB_AVAILABLE", False):

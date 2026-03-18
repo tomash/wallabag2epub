@@ -75,7 +75,7 @@ class TestWallabag2EpubInit:
         assert c.extension == "epub"
         assert c.starred is True
         assert c.merge is False
-        assert c.nb_articles == 50
+        assert c.nb_articles == 20
 
 
 class TestFromConfigFile:

@@ -200,9 +200,19 @@ class EpubMerger:
                 "ebooklib is required for merge. Install with: pip install ebooklib"
             )
 
-        # Default title with creation datetime (e.g. "Wallabag Export from 2026-03-15 17:30")
-        if not title or title == "Merged Articles":
-            title = f"Wallabag Export from {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        # Use a single ISO datetime for both title and output filename.
+        # Keep the title as a true ISO 8601 string; make the filename variant filesystem-safe.
+        created_iso = datetime.now().astimezone().replace(microsecond=0).isoformat()
+        created_iso_for_filename = created_iso.replace(":", "-")
+
+        # TOC/book title
+        title = f"Wallabag Export from {created_iso}"
+
+        # Output filename
+        out_p = Path(output_path)
+        output_path = str(
+            out_p.with_name(f"{out_p.stem}_{created_iso_for_filename}{out_p.suffix}")
+        )
 
         merged = epub.EpubBook()
         merged.set_identifier("merged-" + str(hash(tuple(epub_paths)))[:12])
@@ -297,7 +307,12 @@ class EpubMerger:
                 if not added_toc_for_article and (
                     main_content_id is None or item.get_id() == main_content_id
                 ):
-                    toc_entries.append(epub.Link(new_href, chapter_title, new_id))
+                    toc_label = (
+                        f"Article {idx + 1} — {chapter_title}"
+                        if (item.title or "").strip()
+                        else f"Article {idx + 1}"
+                    )
+                    toc_entries.append(epub.Link(new_href, toc_label, new_id))
                     added_toc_for_article = True
                 spine_items.append(new_chapter)
                 chapters_for_cover_remap.append(new_chapter)
