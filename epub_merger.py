@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import http.client
 import os
 import re
 import sys
@@ -237,6 +238,10 @@ def _normalize_remote_image_url(url_raw: str) -> str | None:
         return None
 
     url_unescaped = html_std.unescape(url_raw.strip())
+    # srcset-like descriptor values can get captured as part of the URL
+    # (e.g. "...ssl=1 300w"). urlopen/http.client rejects whitespace/control
+    # characters, so strip anything after the first whitespace.
+    url_unescaped = re.split(r"\s+", url_unescaped, maxsplit=1)[0]
 
     if url_unescaped.startswith(("data:", "blob:", "cid:")):
         return None
@@ -443,6 +448,9 @@ def _embed_missing_archive_item(epub_path: str, missing_name: str) -> str:
                 payload = _placeholder_image_bytes(missing_name)
             else:
                 raise
+        except (http.client.InvalidURL, ValueError, Exception):
+            # Don't fail the whole merge due to one broken URL.
+            payload = _placeholder_image_bytes(missing_name)
     else:
         # We couldn't derive a downloadable URL (common for relative
         # "/images/...png" values embedded into ebook member names). If the
@@ -732,6 +740,13 @@ class EpubMerger:
                                 payload = _placeholder_image_bytes(url_norm)
                             else:
                                 raise
+                        except (http.client.InvalidURL, ValueError, Exception) as dl_err:
+                            print(
+                                f"Download failed (using placeholder): {url_norm} ({dl_err})",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            payload = _placeholder_image_bytes(url_norm)
 
                         merged.add_item(
                             epub.EpubItem(
