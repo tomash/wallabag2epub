@@ -8,9 +8,11 @@ import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 try:
     from ebooklib import epub
@@ -39,6 +41,38 @@ def _is_auxiliary_doc(file_name: str) -> bool:
 
 _XML10_FORBIDDEN_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _BARE_AMP_RE = re.compile(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z][A-Za-z0-9]+;)")
+_IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)(?:$|[?#])", re.I)
+
+
+def _looks_like_missing_archive_image_name(name: str) -> bool:
+    n = name or ""
+    return bool(_IMAGE_EXT_RE.search(n)) and "images/" in n.lower()
+
+
+def _extract_missing_archive_name(err_msg: str) -> str | None:
+    """
+    Try to extract the missing archive member name from an ebooklib error.
+
+    Observed formats:
+      - "There is no item named 'OEBPS/images/https:/...jpg' in the archive"
+      - "OEBPS/images/image?url=/images/...png"
+    """
+    # Most specific form first.
+    m = re.search(r"There is no item named '([^']+)' in the archive", err_msg)
+    if m:
+        return m.group(1)
+
+    # Fallback: try to locate any images/...<ext> substring.
+    # Keep it conservative to avoid grabbing unrelated content.
+    m = re.search(
+        r"((?:OEBPS|OPS)?/?images/[^'\"\s]+?\.(?:png|jpe?g|gif|webp|svg)(?:\?[^'\"\s]*)?)",
+        err_msg,
+        flags=re.I,
+    )
+    if m:
+        candidate = m.group(1)
+        return candidate
+    return None
 
 
 def _sanitize_xhtml_text(text: str) -> str:
@@ -55,7 +89,20 @@ def _sanitize_xhtml_text(text: str) -> str:
     text = text.replace("&nbsp;", "&#160;")
     # Escape bare ampersands (while keeping well-formed entities intact).
     text = _BARE_AMP_RE.sub("&amp;", text)
-    return text
+
+    # Last-resort: run through a tolerant HTML parser and serialize back to
+    # XML-ish markup so it becomes well-formed for ElementTree.
+    # This helps with "not well-formed (invalid token)" coming from
+    # malformed escaping or broken tag structure.
+    try:
+        from lxml import html  # type: ignore
+
+        doc = html.fromstring(text)
+        # method="xml" helps produce well-formed output.
+        serialized = html.tostring(doc, method="xml", encoding="unicode")
+        return serialized
+    except Exception:
+        return text
 
 
 def _download_url_bytes(url: str, timeout_s: int = 20) -> bytes:
@@ -277,6 +324,91 @@ def _sanitize_epub_xhtml(epub_path: str) -> str:
         raise
 
 
+def _embed_missing_archive_item(epub_path: str, missing_name: str) -> str:
+    """
+    Create a temporary EPUB where a specific missing archive item is added.
+
+    This is a second-level fix for errors like:
+        "There is no item named 'OEBPS/images/https:/...jpg' in the archive"
+    which may come from broken src/href references that are not part of the OPF
+    manifest. When the missing name looks like a downloadable image URL (or
+    contains one), download and embed it under exactly that missing_name.
+    """
+    url = _guess_image_url_from_href(missing_name)
+    if url and _looks_like_image_url(url):
+        # If the URL returns 4xx (e.g. missing/blocked), embed a placeholder so
+        # we can still finish merging.
+        try:
+            payload = _download_url_bytes(url)
+        except HTTPError as http_err:
+            if 400 <= int(getattr(http_err, "code", 0) or 0) < 500:
+                payload = _placeholder_image_bytes(missing_name)
+            else:
+                raise
+    else:
+        # We couldn't derive a downloadable URL (common for relative
+        # "/images/...png" values embedded into ebook member names). If the
+        # missing archive member looks like an image, insert a placeholder.
+        if not _looks_like_missing_archive_image_name(missing_name):
+            raise FileNotFoundError(missing_name)
+        payload = _placeholder_image_bytes(missing_name)
+
+
+    src_path = Path(epub_path).resolve()
+    fd, tmp_path = tempfile.mkstemp(suffix=".epub")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(src_path, "r") as zf_in, zipfile.ZipFile(
+            tmp_path, "w", zipfile.ZIP_DEFLATED
+        ) as zf_out:
+            for name in zf_in.namelist():
+                zf_out.writestr(name, zf_in.read(name))
+            # Embed exactly under the name zipfile/ebooklib is asking for.
+            zf_out.writestr(missing_name, payload)
+        return tmp_path
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+
+
+def _placeholder_image_bytes(missing_name: str) -> bytes:
+    """
+    Return a small placeholder image (encoded to the best effort based on filename).
+    Uses Pillow when available, otherwise falls back to a tiny PNG.
+    """
+    ext = (Path(missing_name).suffix or "").lower().lstrip(".")
+    # Default: PNG is most universally safe in EPUB tooling.
+    fmt = "PNG"
+
+    if ext in ("jpg", "jpeg"):
+        fmt = "JPEG"
+    elif ext == "gif":
+        fmt = "GIF"
+    elif ext == "webp":
+        fmt = "WEBP"
+
+    try:
+        from PIL import Image  # type: ignore
+
+        # Tiny opaque placeholder; readers generally do not care about aesthetics.
+        img = Image.new("RGB", (8, 8), color=(200, 200, 200))
+        buf = BytesIO()
+        save_kwargs = {}
+        if fmt == "JPEG":
+            save_kwargs["quality"] = 75
+        img.save(buf, format=fmt, **save_kwargs)
+        return buf.getvalue()
+    except Exception:
+        # 1x1 transparent-ish PNG (base64) fallback.
+        import base64
+
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+            "/w8AAn8B9o5GxwAAAABJRU5ErkJggg=="
+        )
+        return base64.b64decode(png_b64)
+
+
 def _read_epub_robust(path: str, options: dict | None = None) -> "epub.EpubBook":
     """
     Read an EPUB, fixing manifest entries for missing archive items if needed
@@ -288,11 +420,35 @@ def _read_epub_robust(path: str, options: dict | None = None) -> "epub.EpubBook"
         return epub.read_epub(path, options=options)
     except Exception as e:
         err_msg = str(e)
-        # 1) Missing archive items referenced by OPF manifest.
-        if "There is no item named" in err_msg or "no item named" in err_msg.lower():
+        # 1) Missing archive items.
+        missing_name = _extract_missing_archive_name(err_msg)
+        if missing_name and _looks_like_missing_archive_image_name(missing_name):
             fixed_path = _fix_epub_missing_manifest(path)
             try:
                 return epub.read_epub(fixed_path, options=options)
+            except Exception as e2:
+                embedded_path = _embed_missing_archive_item(
+                    fixed_path, missing_name
+                )
+                try:
+                    try:
+                        return epub.read_epub(embedded_path, options=options)
+                    except Exception:
+                        # If inserting an image placeholder didn't fix the read
+                        # (e.g. other XHTML issues), sanitize XHTML and retry.
+                        sanitized_path = _sanitize_epub_xhtml(embedded_path)
+                        try:
+                            return epub.read_epub(
+                                sanitized_path, options=options
+                            )
+                        finally:
+                            if sanitized_path != embedded_path and Path(
+                                sanitized_path
+                            ).exists():
+                                Path(sanitized_path).unlink(missing_ok=True)
+                finally:
+                    if embedded_path != path and Path(embedded_path).exists():
+                        Path(embedded_path).unlink(missing_ok=True)
             finally:
                 if fixed_path != path and Path(fixed_path).exists():
                     Path(fixed_path).unlink(missing_ok=True)
