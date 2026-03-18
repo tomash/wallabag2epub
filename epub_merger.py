@@ -232,6 +232,8 @@ class EpubMerger:
                 print(f"Warning: Could not read {path}: {e}")
                 continue
 
+            # Best-effort article title for TOC labels (wallabag often stores it on the book, not on the HTML item).
+            book_level_title = (getattr(book, "title", None) or "").strip()
             main_content_id = _main_content_id(book)
             added_toc_for_article = False
 
@@ -307,9 +309,10 @@ class EpubMerger:
                 if not added_toc_for_article and (
                     main_content_id is None or item.get_id() == main_content_id
                 ):
+                    best_title = ((item.title or "").strip() or book_level_title or chapter_title).strip()
                     toc_label = (
-                        f"Article {idx + 1} — {chapter_title}"
-                        if (item.title or "").strip()
+                        f"Article {idx + 1} — {best_title}"
+                        if best_title and best_title != f"Article {idx + 1}"
                         else f"Article {idx + 1}"
                     )
                     toc_entries.append(epub.Link(new_href, toc_label, new_id))
