@@ -3,7 +3,7 @@
 """
 Script to mass download EPUB or PDF (or mobi, html) from your wallabag server
 Starred articles are exported as epub (may be changed in config)
-beginning from the newest, as far 50 at once
+beginning from the newest, as far 20 at once
 and are set as read after that.
 
 No other filtering is done.
@@ -22,6 +22,7 @@ client_id: idcreatedforthisappontheserver
 client_secret: secretcreatedforthisappontheserver
 extension: epub   # default, or 'xml', 'json', 'txt', 'csv', 'pdf', 'epub', 'mobi', 'html'...
 starred: true     # default, or false
+nb_articles: 20   # optional: how many newest articles to export
 """
 
 import yaml
@@ -34,7 +35,7 @@ class Wallabag2Epub:
     """Client for exporting articles from Wallabag to EPUB/PDF and other formats."""
 
     KEEP_CHARACTERS = (" ", ".", "_")
-    DEFAULT_NB_ARTICLES = 50
+    DEFAULT_NB_ARTICLES = 20
 
     def __init__(
         self,
@@ -46,7 +47,7 @@ class Wallabag2Epub:
         extension: str = "epub",
         starred: bool = True,
         merge: bool = False,
-        nb_articles: int = 50,
+        nb_articles: int = DEFAULT_NB_ARTICLES,
     ):
         self.url = url.rstrip("/")
         self.user = user
@@ -72,7 +73,7 @@ class Wallabag2Epub:
             extension=infocon.get("extension", "epub"),
             starred=infocon.get("starred", True),
             merge=infocon.get("merge", False),
-            nb_articles=cls.DEFAULT_NB_ARTICLES,
+            nb_articles=int(infocon.get("nb_articles", cls.DEFAULT_NB_ARTICLES)),
         )
 
     def _auth_params(self) -> dict:
