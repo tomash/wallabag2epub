@@ -1,6 +1,7 @@
 """EPUB merging: combine multiple EPUB files into one with a table of contents."""
 
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+import html as html_std
 
 try:
     from ebooklib import epub
@@ -106,6 +108,9 @@ def _sanitize_xhtml_text(text: str) -> str:
 
 
 def _download_url_bytes(url: str, timeout_s: int = 20) -> bytes:
+    # Progress output: show which external URL we are downloading.
+    # Keep this in stdout so users can see progress while merge runs.
+    print(f"Downloading image: {url}", flush=True)
     req = Request(
         url,
         headers={
@@ -165,6 +170,99 @@ def _looks_like_image_url(url: str) -> bool:
     p = urlparse(url)
     path = (p.path or "").lower()
     return any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"))
+
+
+_XHTML_IMG_ATTR_RE = re.compile(
+    r"""(?ix)
+    \b(?:src|href)\s*=\s*(?P<q>["'])(?P<url>[^"']+)(?P=q)
+    """
+)
+_XHTML_CSS_URL_RE = re.compile(
+    r"""(?ix)
+    url\(\s*(?P<q>["']?)(?P<url>[^"')\s]+)(?P=q)\s*\)
+    """
+)
+
+
+_REMOTE_IMAGE_URL_RE = re.compile(
+    r"""(?ix)
+    \b
+    (?:
+        https?://
+      | https?:/
+      | //
+    )
+    [^\s"'<>(),]+?
+    \.(?:png|jpe?g|gif|webp|svg)
+    (?:\?[^"'<>(),]*)?
+    (?:\#[^"'<>(),]*)?
+    """,
+)
+
+
+def _iter_remote_image_urls_from_text(text: str) -> list[str]:
+    """
+    Extract remote image URLs from arbitrary XHTML/HTML text.
+
+    Supports:
+    - https?://... (normal absolute URLs)
+    - https:/...  (broken scheme, one slash)
+    - //...       (protocol-relative)
+    """
+    if not text:
+        return []
+    return [m.group(0) for m in _REMOTE_IMAGE_URL_RE.finditer(text)]
+
+
+def _iter_image_urls_in_xhtml(xhtml: str) -> list[str]:
+    """
+    Extract URL-ish values from typical image references in XHTML:
+    - src/href attributes
+    - CSS url(...) fragments
+    """
+    urls: list[str] = []
+    for m in _XHTML_IMG_ATTR_RE.finditer(xhtml):
+        urls.append(m.group("url"))
+    for m in _XHTML_CSS_URL_RE.finditer(xhtml):
+        urls.append(m.group("url"))
+    return urls
+
+
+def _normalize_remote_image_url(url_raw: str) -> str | None:
+    """
+    Normalize a markup URL value into a downloadable absolute URL.
+    Returns None when the URL is not a remote http(s) image.
+    """
+    if not url_raw:
+        return None
+
+    url_unescaped = html_std.unescape(url_raw.strip())
+
+    if url_unescaped.startswith(("data:", "blob:", "cid:")):
+        return None
+
+    if url_unescaped.startswith("//"):
+        url_unescaped = "https:" + url_unescaped
+
+    url_norm = _guess_image_url_from_href(url_unescaped)
+    if not url_norm or not _looks_like_image_url(url_norm):
+        return None
+    return url_norm
+
+
+def _media_type_for_image_url(url: str) -> str:
+    path = (urlparse(url).path or "").lower()
+    if path.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if path.endswith(".png"):
+        return "image/png"
+    if path.endswith(".gif"):
+        return "image/gif"
+    if path.endswith(".webp"):
+        return "image/webp"
+    if path.endswith(".svg"):
+        return "image/svg+xml"
+    return "application/octet-stream"
 
 
 def _main_content_id(book: "epub.EpubBook") -> str | None:
@@ -422,33 +520,49 @@ def _read_epub_robust(path: str, options: dict | None = None) -> "epub.EpubBook"
         err_msg = str(e)
         # 1) Missing archive items.
         missing_name = _extract_missing_archive_name(err_msg)
-        if missing_name and _looks_like_missing_archive_image_name(missing_name):
+        if missing_name:
             fixed_path = _fix_epub_missing_manifest(path)
             try:
-                return epub.read_epub(fixed_path, options=options)
-            except Exception as e2:
-                embedded_path = _embed_missing_archive_item(
-                    fixed_path, missing_name
-                )
                 try:
-                    try:
-                        return epub.read_epub(embedded_path, options=options)
-                    except Exception:
-                        # If inserting an image placeholder didn't fix the read
-                        # (e.g. other XHTML issues), sanitize XHTML and retry.
-                        sanitized_path = _sanitize_epub_xhtml(embedded_path)
+                    return epub.read_epub(fixed_path, options=options)
+                except Exception:
+                    # Only attempt the 2nd-level "embed the missing item"
+                    # for image-like missing paths. For other media references,
+                    # just removing dangling manifest/spine entries is usually
+                    # enough to let ebooklib proceed.
+                    if _looks_like_missing_archive_image_name(missing_name):
+                        embedded_path = _embed_missing_archive_item(
+                            fixed_path, missing_name
+                        )
                         try:
-                            return epub.read_epub(
-                                sanitized_path, options=options
-                            )
+                            try:
+                                return epub.read_epub(
+                                    embedded_path, options=options
+                                )
+                            except Exception:
+                                # If inserting an image placeholder didn't fix the read
+                                # (e.g. other XHTML issues), sanitize XHTML and retry.
+                                sanitized_path = _sanitize_epub_xhtml(
+                                    embedded_path
+                                )
+                                try:
+                                    return epub.read_epub(
+                                        sanitized_path, options=options
+                                    )
+                                finally:
+                                    if sanitized_path != embedded_path and Path(
+                                        sanitized_path
+                                    ).exists():
+                                        Path(sanitized_path).unlink(
+                                            missing_ok=True
+                                        )
                         finally:
-                            if sanitized_path != embedded_path and Path(
-                                sanitized_path
+                            if embedded_path != path and Path(
+                                embedded_path
                             ).exists():
-                                Path(sanitized_path).unlink(missing_ok=True)
-                finally:
-                    if embedded_path != path and Path(embedded_path).exists():
-                        Path(embedded_path).unlink(missing_ok=True)
+                                Path(embedded_path).unlink(missing_ok=True)
+                    # If it still fails, let the outer fallbacks handle it
+                    # (e.g. XHTML sanitization below).
             finally:
                 if fixed_path != path and Path(fixed_path).exists():
                     Path(fixed_path).unlink(missing_ok=True)
@@ -520,8 +634,10 @@ class EpubMerger:
         toc_entries = []
         spine_items = ["nav"]
         chapters_for_cover_remap = []  # EpubHtml items to fix CoverPage/toc links later
+        downloaded_image_internal_files: dict[str, str] = {}  # url_norm -> file_name
 
         for idx, path in enumerate(epub_paths):
+            print(f"Merging EPUB {idx + 1}/{len(epub_paths)}: {path}", flush=True)
             href_map = {}
             prefix = f"article_{idx:04d}_"
             try:
@@ -586,11 +702,61 @@ class EpubMerger:
                 if isinstance(content, bytes):
                     content = content.decode("utf-8", errors="replace")
 
+                # Download remote images referenced from this XHTML and embed them locally.
+                # We replace the raw remote URL substrings everywhere they occur (src, href, srcset, CSS, ...),
+                # so the merged EPUB never points to remote image URLs.
+                remote_href_updates: dict[str, str] = {}  # url_raw -> internal_file
+                url_candidates = set(_iter_image_urls_in_xhtml(content))
+                url_candidates.update(_iter_remote_image_urls_from_text(content))
+                for url_raw in url_candidates:
+                    url_norm = _normalize_remote_image_url(url_raw)
+                    if not url_norm:
+                        continue
+
+                    internal_file = downloaded_image_internal_files.get(url_norm)
+                    if not internal_file:
+                        # Choose extension from the normalized URL path.
+                        ext = (Path(urlparse(url_norm).path).suffix or "").lower()
+                        if not ext:
+                            ext = ".img"
+                        digest = hashlib.sha256(url_norm.encode("utf-8")).hexdigest()[:16]
+                        internal_file = f"downloaded_images/{digest}{ext}"
+                        uid = f"img_{digest}"
+                        media_type = _media_type_for_image_url(url_norm)
+
+                        try:
+                            payload = _download_url_bytes(url_norm)
+                        except HTTPError as http_err:
+                            code = int(getattr(http_err, "code", 0) or 0)
+                            if 400 <= code < 500:
+                                payload = _placeholder_image_bytes(url_norm)
+                            else:
+                                raise
+
+                        merged.add_item(
+                            epub.EpubItem(
+                                uid=uid,
+                                file_name=internal_file,
+                                media_type=media_type,
+                                content=payload,
+                            )
+                        )
+                        downloaded_image_internal_files[url_norm] = internal_file
+
+                    remote_href_updates[url_raw] = internal_file
+
+                # Update local href mappings (resource file renames).
                 for old, new in sorted(href_map.items(), key=lambda x: -len(x[0])):
                     content = content.replace(f'href="{old}"', f'href="{new}"')
                     content = content.replace(f"href='{old}'", f"href='{new}'")
                     content = content.replace(f'src="{old}"', f'src="{new}"')
                     content = content.replace(f"src='{old}'", f"src='{new}'")
+
+                # Replace remote image URL substrings everywhere (srcset, CSS, ...).
+                for old, new in sorted(
+                    remote_href_updates.items(), key=lambda x: -len(x[0])
+                ):
+                    content = content.replace(old, new)
 
                 chapter_title = item.title or f"Article {idx + 1}"
                 new_chapter = epub.EpubHtml(
