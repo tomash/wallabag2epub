@@ -1,6 +1,7 @@
 PyYAML
 requests
 ebooklib
+Pillow>=10.0
 
 # dev / test
 pytest>=7.0

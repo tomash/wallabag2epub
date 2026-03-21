@@ -4,6 +4,8 @@ wallabag2epub.login
 *.epub
 .vscode
 .cursor
+epubs_articles/
+epubs_merged/
 
 # Python specific files
 # Byte-compiled / optimized / DLL files
